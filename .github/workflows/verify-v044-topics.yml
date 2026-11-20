@@ -1,0 +1,190 @@
+name: Verify public v0.44.0 Action Topics
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: verify-public-action-test-gh-settings-public
+  cancel-in-progress: false
+jobs:
+  preflight:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'daiksud/test-gh-settings-public'
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions: {contents: read, actions: read}
+    outputs:
+      environment-id: ${{ steps.check.outputs.environment-id }}
+    steps:
+      - name: Require the pre-existing protected Environment before scheduling its job
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SOURCE: ${{ github.sha }}
+        run: |
+          python3 - <<'PY_GUARD'
+          import json
+          import os
+          import subprocess
+
+          repo = "daiksud/test-gh-settings-public"
+          environment = "gh-settings-probe"
+
+          def read(path):
+              result = subprocess.run(["gh", "api", "--hostname", "github.com", path],
+                                      capture_output=True, text=True, timeout=60)
+              if result.returncode:
+                  raise SystemExit("Required read failed; pre-create and inspect the protected Environment. No token job started.")
+              return json.loads(result.stdout)
+
+          metadata = read(f"repos/{repo}")
+          assert (metadata.get("id") == 1444211116 and metadata.get("full_name") == repo
+                  and metadata.get("private") is False and metadata.get("archived") is False
+                  and metadata.get("owner", {}).get("id") == 155234749
+                  and metadata["owner"].get("type") == "User"
+                  and metadata.get("default_branch") == "main"), "Unexpected target repository"
+          assert read(f"repos/{repo}/git/ref/heads/main")["object"]["sha"] == os.environ["EXPECTED_SOURCE"], "main moved"
+          policy = read(f"repos/{repo}/environments/{environment}")
+          assert (policy.get("name") == environment and type(policy.get("id")) is int
+                  and policy["id"] > 0), "Pre-existing Environment required"
+          assert policy.get("deployment_branch_policy") == {
+              "protected_branches": False, "custom_branch_policies": True}, "Selected main branch required"
+          rules = policy.get("protection_rules", [])
+          assert all(rule.get("type") in ("required_reviewers", "branch_policy", "wait_timer") for rule in rules), "Inspect unrecognized protection"
+          review = [rule for rule in rules if rule.get("type") == "required_reviewers"]
+          assert len(review) == 1 and review[0].get("prevent_self_review") is False, "Daiki approval must be possible"
+          reviewers = review[0].get("reviewers", [])
+          assert (len(reviewers) == 1 and reviewers[0].get("type") == "User"
+                  and reviewers[0].get("reviewer", {}).get("id") == 155234749), "Require Daiki approval"
+          assert policy.get("can_admins_bypass") is not True, "Disable administrator bypass"
+          branches = read(f"repos/{repo}/environments/{environment}/deployment-branch-policies?per_page=100")
+          assert branches.get("total_count") == 1, "Exactly one branch policy required"
+          items = branches.get("branch_policies", [])
+          assert len(items) == 1 and items[0].get("name") == "main" and items[0].get("type") == "branch", "Only typed Branch main allowed"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"environment-id={policy['id']}\n")
+          print("Pre-existing Environment, required reviewer, main-only policy and repository identity verified")
+          PY_GUARD
+  topics:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'daiksud/test-gh-settings-public'
+    needs: preflight
+    permissions: {contents: read, actions: read}
+    environment: gh-settings-probe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout reviewed probe source without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: daiksud/gh-settings
+          ref: 948873d260be87aecc3d0597f715a8c09e1347b9 # v0.44.0
+          path: .verification-source
+          persist-credentials: false
+      - name: Recheck the approved Environment and reviewed main before token issuance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SOURCE: ${{ github.sha }}
+          EXPECTED_ENVIRONMENT_ID: ${{ needs.preflight.outputs.environment-id }}
+          HAS_CLIENT_ID: ${{ vars.PROBE_APP_CLIENT_ID != '' }}
+          HAS_PRIVATE_KEY: ${{ secrets.PROBE_APP_PRIVATE_KEY != '' }}
+        run: |
+          set -euo pipefail
+          [[ "$HAS_CLIENT_ID" == true && "$HAS_PRIVATE_KEY" == true ]] || {
+            echo 'Configure the Environment variable and secret before dispatch' >&2; exit 1;
+          }
+          [[ "$(gh api repos/daiksud/test-gh-settings-public/environments/gh-settings-probe --jq '.id')" == "$EXPECTED_ENVIRONMENT_ID" ]]
+          [[ "$(gh api repos/daiksud/test-gh-settings-public/git/ref/heads/main --jq '.object.sha')" == "$EXPECTED_SOURCE" ]]
+          [[ "$(git -C .verification-source rev-parse HEAD)" == 948873d260be87aecc3d0597f715a8c09e1347b9 ]]
+          [[ -z "$(git -C .verification-source status --porcelain)" ]]
+      - name: Mint a token only for the dedicated test repository
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.PROBE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PROBE_APP_PRIVATE_KEY }}
+          owner: daiksud
+          repositories: test-gh-settings-public
+          permission-administration: write
+      - name: Observe original Topics and create an isolated local consumer
+        id: prepare
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: python3 .verification-source/.github/scripts/verify-public-topics.py prepare
+      - name: Validate through the published Action and real release installer
+        id: validate
+        uses: daiksud/gh-settings@948873d260be87aecc3d0597f715a8c09e1347b9 # v0.44.0
+        with:
+          command: validate
+      - name: Plan the single-topic addition
+        uses: daiksud/gh-settings@948873d260be87aecc3d0597f715a8c09e1347b9 # v0.44.0
+        with:
+          command: plan
+          token: ${{ steps.app.outputs.token }}
+      - name: Check package identity and fresh baseline immediately before apply
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          EXPECTED_CLI_VERSION: v0.44.0
+          EXPECTED_CLI_SHA256: 050d720aa3eb90fda288a44e5d0fdae8308aa4e694f0a8ad7c92488ddd8f8aa1
+          ACTION_TARGET: ${{ steps.validate.outputs.target }}
+          ACTION_VERSION: ${{ steps.validate.outputs.cli-version }}
+          ACTION_DIGEST: ${{ steps.validate.outputs.cli-sha256 }}
+        run: python3 .verification-source/.github/scripts/verify-public-topics.py arm
+      - name: Apply Topics through the published Action
+        uses: daiksud/gh-settings@948873d260be87aecc3d0597f715a8c09e1347b9 # v0.44.0
+        with:
+          command: apply
+          token: ${{ steps.app.outputs.token }}
+      - name: Independently read back the topic set
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: python3 .verification-source/.github/scripts/verify-public-topics.py verify-desired
+      - name: Plan the matching repeat
+        id: repeat-plan
+        uses: daiksud/gh-settings@948873d260be87aecc3d0597f715a8c09e1347b9 # v0.44.0
+        with:
+          command: plan
+          plan-reporting: status-only
+          token: ${{ steps.app.outputs.token }}
+      - name: Require a no-difference plan and recheck before repeat apply
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PLAN_OUTCOME: ${{ steps.repeat-plan.outputs.plan-outcome }}
+        run: python3 .verification-source/.github/scripts/verify-public-topics.py verify-repeat
+      - name: Repeat apply through the published Action
+        uses: daiksud/gh-settings@948873d260be87aecc3d0597f715a8c09e1347b9 # v0.44.0
+        with:
+          command: apply
+          token: ${{ steps.app.outputs.token }}
+      - name: Independently read back the repeat
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: python3 .verification-source/.github/scripts/verify-public-topics.py verify-desired
+      - name: Check for conflicts before preparing restoration
+        id: restore-config
+        if: always() && steps.prepare.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: python3 .verification-source/.github/scripts/verify-public-topics.py restore-config
+      - name: Restore original Topics through the published Action
+        if: always() && steps.restore-config.outputs.ready == 'true'
+        uses: daiksud/gh-settings@948873d260be87aecc3d0597f715a8c09e1347b9 # v0.44.0
+        with:
+          command: apply
+          token: ${{ steps.app.outputs.token }}
+      - name: Independently verify restoration
+        if: always() && steps.restore-config.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: python3 .verification-source/.github/scripts/verify-public-topics.py verify-restored
+      - name: Plan the restored baseline
+        id: final-plan
+        if: always() && steps.restore-config.outputs.ready == 'true'
+        uses: daiksud/gh-settings@948873d260be87aecc3d0597f715a8c09e1347b9 # v0.44.0
+        with:
+          command: plan
+          plan-reporting: status-only
+          token: ${{ steps.app.outputs.token }}
+      - name: Require the restored no-difference plan and final independent readback
+        if: always() && steps.restore-config.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PLAN_OUTCOME: ${{ steps.final-plan.outputs.plan-outcome }}
+        run: python3 .verification-source/.github/scripts/verify-public-topics.py verify-final-plan
